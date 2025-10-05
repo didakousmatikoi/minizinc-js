@@ -85,6 +85,24 @@ const node = (output) => ({
   ],
 });
 
+const service = (output) => ({
+  input: "src/service.js",
+  output: {
+    sourcemap: !production,
+    ...output,
+  },
+  plugins: [production && terser()],
+  external: [
+    "node:child_process",
+    "node:events",
+    "node:readline",
+    "node:fs/promises",
+    "node:path",
+    "node:crypto",
+    "jszip",
+  ],
+});
+
 const configs = testing
   ? [
       // Bundles for running tests
@@ -101,6 +119,10 @@ const configs = testing
       }),
       node({
         file: "dist/test-minizinc-node.cjs",
+        format: "cjs",
+      }),
+      service({
+        file: "dist/test-minizinc-service.cjs",
         format: "cjs",
       }),
     ]
@@ -132,6 +154,14 @@ const configs = testing
       }),
       node({
         file: "dist/minizinc-node.mjs",
+        format: "es",
+      }),
+      service({
+        file: "dist/minizinc-service.cjs",
+        format: "cjs",
+      }),
+      service({
+        file: "dist/minizinc-service.mjs",
         format: "es",
       }),
     ];

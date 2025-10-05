@@ -1,5 +1,5 @@
 {
-  "name": "minizinc",
+  "name": "@akousmatikoi/minizinc",
   "version": "4.4.4",
   "description": "JavaScript API for MiniZinc",
   "homepage": "https://js.minizinc.dev",
@@ -15,6 +15,11 @@
       },
       "require": "./dist/minizinc.cjs",
       "default": "./dist/minizinc.mjs"
+    },
+    "./service": {
+      "types": "./types/index.d.ts",
+      "require": "./dist/minizinc-service.cjs",
+      "default": "./dist/minizinc-service.mjs"
     },
     "./minizinc-worker.js": "./dist/minizinc-worker.js",
     "./minizinc.wasm": "./dist/minizinc.wasm",
@@ -47,5 +52,9 @@
     "rollup-plugin-copy": "^3.5.0",
     "typedoc": "^0.28.13",
     "web-worker": "1.3.0"
+  },
+  "dependencies": {
+    "@akousmatikoi/yell.client": "^1.0.0",
+    "jszip": "^3.10.1"
   }
 }

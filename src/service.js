@@ -1,0 +1,484 @@
+// Controller used in node environments which uses child processes instead of wasm
+
+import child_process from "node:child_process";
+import EventEmitter from "node:events";
+import rl from "node:readline";
+import fs from "node:fs/promises";
+import path from "node:path";
+import crypto from "node:crypto";
+import JSZip from "jszip";
+import { spawn } from "@akousmatikoi/yell.client";
+
+/**
+ * @todo add nice defaults
+ */
+let settings = {
+  service: "http://localhost:4222",
+};
+
+export async function init(configuration) {
+  if (configuration) {
+    settings = { ...settings, ...configuration };
+  }
+}
+
+const childProcesses = new Set();
+
+export async function shutdown() {
+  // for (const proc of childProcesses) {
+  //   proc.kill("SIGKILL");
+  // }
+  // childProcesses.clear();
+
+  return fetch(new URL("/shutdown", settings.service), {
+    method: "POST",
+  });
+}
+
+export class Model {
+  constructor() {
+    this.vfs = {};
+    this._toRun = [];
+  }
+  clone() {
+    const clone = new Model();
+    clone.vfs = { ...this.vfs };
+    clone._toRun = [...this._toRun];
+    return clone;
+  }
+  addString(model) {
+    const filename = `_mzn_${crypto.randomUUID()}.mzn`;
+    this._addVirtual(filename, model);
+    return filename;
+  }
+  addDznString(dzn) {
+    const filename = `_dzn_${crypto.randomUUID()}.dzn`;
+    this._addVirtual(filename, dzn);
+    return filename;
+  }
+  addJson(data) {
+    const filename = `_json_${crypto.randomUUID()}.json`;
+    this._addVirtual(filename, JSON.stringify(data));
+    return filename;
+  }
+  _add_toRun(filename, use) {
+    if (
+      use &&
+      (filename.endsWith(".mzn") ||
+        filename.endsWith(".mzc") ||
+        filename.endsWith(".dzn") ||
+        filename.endsWith(".json") ||
+        filename.endsWith(".mpc") ||
+        filename.endsWith(".fzn")) &&
+      this._toRun.indexOf(filename) === -1
+    ) {
+      this._toRun.push(filename);
+    }
+  }
+  _addVirtual(filename, contents, use = true) {
+    this.vfs[filename] = contents;
+    this._add_toRun(filename, use);
+  }
+  /**
+   *
+   * @argument {*} filename
+   * @argument {*} contents
+   * @argument {*} use
+   */
+  addFile(filename, contents = null, use = true) {
+    if (typeof contents === "string") {
+      this._addVirtual(filename, contents, use);
+    } else {
+      this._add_toRun(filename, use);
+    }
+  }
+  /**
+   *
+   * @argument {*} args
+   * @argument {*} options
+   * @argument {*} outputFiles
+   * @returns
+   */
+  _run(args, options, outputFiles) {
+    const emitter = new EventEmitter();
+    let proc = null;
+    emitter.on("sigint", () => {
+      if (proc) {
+        proc.kill("SIGINT");
+      } else {
+        proc = false;
+      }
+    });
+    (async () => {
+      console.log("### running", args);
+      const preArgs = ["--json-stream"];
+
+      // const tempdir = await fs.mkdtemp(path.join(os.tmpdir(), "mzn"));
+      const zip = new JSZip();
+
+      if (options) {
+        // const mpcFile = path.join(tempdir, `_mzn_${crypto.randomUUID()}.mpc`);
+        // await fs.writeFile(mpcFile, JSON.stringify(options));
+        const mcpFile = `_mzn_${crypto.randomUUID()}.mpc`;
+        zip.file(mcpFile, JSON.stringify(options));
+
+        preArgs.push(mcpFile);
+      }
+
+      for (const key in this.vfs) {
+        // await fs.writeFile(path.join(tempdir, key), this.vfs[key]);
+        zip.file(key, this.vfs[key]);
+      }
+
+      console.log("### spawning", settings._executable, [...preArgs, ...args]);
+
+      if (proc === false) {
+        emitter.emit("exit", { code: 0 });
+        return;
+      }
+
+      console.log("### checking files to run", this._toRun);
+
+      try {
+        // this._toRun.forEach((file) => {
+        //   if (file in this.vfs) {
+        //     zip.file(file, this.vfs[file]);
+        //   } else {
+        //     zip.file(file, fs.readFileSync(file));
+        //   }
+        // });
+
+        const ARGUMENTS = [];
+
+        const body = new FormData();
+        // body.append(
+        //   "file",
+        //   new Blob([await zip.generateAsync({ type: "nodebuffer" })]),
+        //   "model.zip"
+        // );
+        body.append("arguments", [...preArgs, ...args].join(","));
+        console.log("### spawning?", [...preArgs, ...args].join(","));
+        proc = spawn("minizinc", [
+          ...preArgs,
+          ...args.map((x) =>
+            outputFiles && outputFiles.indexOf(x) !== -1
+              ? path.join(tempdir, x)
+              : x
+          ),
+          ...this._toRun.map((x) => {
+            if (x in this.vfs) {
+              return path.join(tempdir, x);
+            } else {
+              return x;
+            }
+          }),
+        ]);
+      childProcesses.add(proc);
+      const stdout = rl.createInterface(proc.stdout);
+      stdout.on("line", async (line) => {
+        try {
+          const obj = JSON.parse(line);
+          if (
+            "location" in obj &&
+            "filename" in obj.location &&
+            typeof obj.location.filename === "string" &&
+            obj.location.filename.indexOf(tempdir) === 0
+          ) {
+            // Strip prefix from filename
+            obj.location.filename = obj.location.filename.substring(
+              tempdir.length
+            );
+          }
+          if ("stack" in obj && Array.isArray(obj.stack)) {
+            for (const s of obj.stack) {
+              if (
+                "location" in s &&
+                "filename" in s.location &&
+                typeof s.location.filename === "string" &&
+                s.location.filename.indexOf(tempdir) === 0
+              ) {
+                // Strip prefix from filename
+                s.location.filename = s.location.filename.substring(
+                  tempdir.length
+                );
+              }
+            }
+          }
+          emitter.emit(obj.type, obj);
+        } catch (e) {
+          emitter.emit("stdout", { type: "stdout", value: line });
+        }
+      });
+      const stderr = rl.createInterface(proc.stderr);
+      stderr.on("line", async (line) => {
+        emitter.emit("stderr", line);
+      });
+      proc.on("exit", async (c, signal) => {
+        childProcesses.delete(proc);
+        const exitMessage = {
+          type: "exit",
+          code: signal === "SIGINT" ? null : c,
+        };
+        if (outputFiles) {
+          exitMessage.outputFiles = {};
+          for (const key of outputFiles) {
+            try {
+              exitMessage.outputFiles[key] = await fs.readFile(key, {
+                encoding: "utf8",
+              });
+            } catch (e) {
+              try {
+                exitMessage.outputFiles[key] = await fs.readFile(
+                  path.join(tempdir, key),
+                  { encoding: "utf8" }
+                );
+              } catch (e) {
+                exitMessage.outputFiles[key] = null;
+              }
+            }
+          }
+        }
+        emitter.emit("exit", exitMessage);
+        fs.rm(tempdir, { recursive: true, force: true });
+      });
+
+
+        // if (response.ok) {
+        //   const reader = response.body.getReader();
+
+        //   const stdout = rl.createInterface();
+        //   const stderr = rl.createInterface();
+
+        //   stdout.on("line", async (line) => {});
+
+        //   stderr.on("line", async (line) => {
+        //     emitter.emit("stderr", line);
+        //   });
+        // } else {
+        //   /**
+        //    * @description handling request failure.
+        //    */
+        //   emitter.emit("exit", {
+        //     type: "exit",
+        //     code: response.status,
+        //   });
+        //   return;
+        // }
+      } catch (error) {
+        // /**
+        //  * @description handling request failure.
+        //  */
+        // emitter.emit("exit", { type: "exit", code: 13 });
+        // return;
+      }
+    })();
+    return emitter;
+  }
+  check(cfg) {
+    const config = { ...cfg };
+    const proc = this._run(["--model-check-only"], config.options);
+    const errors = [];
+    proc.on("error", (e) => errors.push(e));
+    return new Promise((resolve, _reject) => {
+      proc.on("exit", (e) => resolve(errors));
+    });
+  }
+  interface(cfg) {
+    const config = { ...cfg };
+    const proc = this._run(["--model-interface-only"], config.options);
+    const errors = [];
+    let iface = null;
+    proc.on("error", (e) => errors.push(e));
+    proc.on("interface", (e) => (iface = e));
+    return new Promise((resolve, reject) => {
+      proc.on("exit", (e) => {
+        if (e.code === 0) {
+          resolve(iface);
+        } else {
+          reject(errors);
+        }
+      });
+    });
+  }
+  compile(cfg) {
+    const config = { ...cfg };
+    let i = 0;
+    let out = `_fzn_${i++}.fzn`;
+    while (out in this.vfs) {
+      out = `_fzn_${i++}.fzn`;
+    }
+    const args = ["-c", "--fzn", out];
+    let running = true;
+    let error = null;
+    const proc = this._run(args, config.options, [out]);
+    proc.on("exit", () => (running = false));
+    proc.on("error", (e) => {
+      if (!error) error = e;
+    });
+    return {
+      isRunning() {
+        return running;
+      },
+      cancel() {
+        proc.emit("sigint");
+      },
+      on: (event, listener) => proc.on(event, listener),
+      off: (event, listener) => proc.off(event, listener),
+      then(resolve, reject) {
+        proc.on("exit", (e) => {
+          if (e.code === 0) {
+            resolve(e.outputFiles[out]);
+          } else {
+            const exit = error ? { message: error.message, ...e } : e;
+            if (reject) {
+              reject(exit);
+            } else {
+              throw exit;
+            }
+          }
+        });
+      },
+    };
+  }
+  solve(cfg) {
+    const config = { jsonOutput: true, ...cfg };
+    const args = ["-i"]; // Always use intermediate solutions
+    if (config.jsonOutput) {
+      args.push("--output-mode");
+      args.push("json");
+    }
+    let running = true;
+    let error = null;
+    const proc = this._run(args, config.options);
+    proc.on("exit", () => (running = false));
+    let solution = null;
+    let statistics = {};
+    let status = "UNKNOWN";
+    proc.on("statistics", (e) => {
+      statistics = {
+        ...statistics,
+        ...e.statistics,
+      };
+    });
+    proc.on("solution", (e) => {
+      solution = e;
+      status = "SATISFIED";
+    });
+    proc.on("status", (e) => {
+      status = e.status;
+    });
+    proc.on("error", (e) => {
+      if (!error) error = e;
+    });
+    return {
+      isRunning() {
+        return running;
+      },
+      cancel() {
+        proc.emit("sigint");
+      },
+      on: (event, listener) => proc.on(event, listener),
+      off: (event, listener) => proc.off(event, listener),
+      then(resolve, reject) {
+        proc.on("exit", (e) => {
+          if (e.code === 0) {
+            resolve({
+              status,
+              solution,
+              statistics,
+            });
+          } else {
+            const exit = error ? { message: error.message, ...e } : e;
+            if (reject) {
+              reject(exit);
+            } else {
+              throw exit;
+            }
+          }
+        });
+      },
+    };
+  }
+}
+
+export function version() {
+  // return new Promise((resolve, reject) => {
+  //   let proc = null;
+  //   proc = child_process.execFile(
+  //     settings._executable,
+  //     ["--version"],
+  //     (error, stdout, stderr) => {
+  //       childProcesses.delete(proc);
+  //       if (error) {
+  //         reject(error);
+  //       }
+  //       resolve(stdout);
+  //     }
+  //   );
+  //   childProcesses.add(proc);
+  // });
+
+  return fetch(new URL("/version", settings.service)).then((response) =>
+    response.text()
+  );
+}
+
+export function solvers() {
+  // return new Promise((resolve, reject) => {
+  //   let proc = null;
+  //   proc = child_process.execFile(
+  //     settings._executable,
+  //     ["--solvers-json"],
+  //     (error, stdout, stderr) => {
+  //       childProcesses.delete(proc);
+  //       if (error) {
+  //         reject(error);
+  //       }
+  //       resolve(JSON.parse(stdout));
+  //     }
+  //   );
+  //   childProcesses.add(proc);
+  // });
+  return fetch(new URL("/solvers", settings.service)).then((response) =>
+    response.json()
+  );
+}
+
+export function readStdlibFileContents(files) {
+  const keys = Array.isArray(files) ? files : [files];
+  return new Promise((resolve, reject) => {
+    let proc = null;
+    proc = child_process.execFile(
+      settings._executable,
+      ["--config-dirs"],
+      async (error, stdout, stderr) => {
+        childProcesses.delete(proc);
+        if (error) {
+          reject(error);
+        }
+        const mznStdlibDir = JSON.parse(stdout).mznStdlibDir;
+        const result = {};
+        for (const key of keys) {
+          const p = path.join(mznStdlibDir, key);
+          const rel = path.relative(mznStdlibDir, p);
+          if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+            reject(`Unsupported file path ${key}`);
+          }
+          try {
+            result[key] = await fs.readFile(p, {
+              encoding: "utf8",
+            });
+          } catch (e) {
+            result[key] = null;
+          }
+        }
+        if (Array.isArray(files)) {
+          resolve(result);
+        } else {
+          resolve(result[files]);
+        }
+      }
+    );
+    childProcesses.add(proc);
+  });
+}

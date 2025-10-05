@@ -105,7 +105,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
       - name: Bump edge version
-        if: ${{ env.STABLE == 'no' }}
+        if: ${{ env.STABLE == 'no' && github.ref_name == 'develop' }}
         run: |
           npm version prerelease --preid=edge --no-git-tag-version > /dev/null
           PACKAGE=$(jq -r .name package.json)
@@ -121,6 +121,23 @@ jobs:
             fi
           fi
           echo "Bumped edge version to $(jq -r .version package.json)"
+      - name: Bump service version
+        if: ${{ env.STABLE == 'no' && github.ref_name == 'service' }}
+        run: |
+          npm version prerelease --preid=service --no-git-tag-version > /dev/null
+          PACKAGE=$(jq -r .name package.json)
+          if PUBLISHED_SERVICE=$(npm view "${PACKAGE}@service" version 2>/dev/null); then
+            echo "Latest published service version is ${PUBLISHED_SERVICE}"
+            P1=$(echo "${PUBLISHED_SERVICE}" | cut -d - -f 1)
+            P2=$(jq -r .version package.json | cut -d - -f 1)
+            if [[ "$P1" == "$P2" ]]; then
+              jq --arg new_version "${PUBLISHED_SERVICE}" '.version|=$new_version' package.json > package.json.tmp
+              rm package.json
+              mv package.json.tmp package.json
+              npm version prerelease --preid=service --no-git-tag-version > /dev/null
+            fi
+          fi
+          echo "Bumped service version to $(jq -r .version package.json)"
       - name: Build package
         run: npm run build
       - name: Run tests
@@ -128,7 +145,9 @@ jobs:
       - name: Build docs
         run: npm run docs
       - name: Create package
-        run: npm pack
+        run: |
+          npm pack
+          mv *.tgz minizinc.tgz
       - name: Upload docs artifact
         uses: actions/upload-artifact@v4
         with:
@@ -138,13 +157,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: package
-          path: minizinc-*.tgz
+          path: minizinc.tgz
 
   publish:
     name: Publish minizinc-js
     runs-on: ubuntu-latest
-    needs: [build]
-    if: ${{ github.event_name != 'pull_request' && ( startsWith(github.ref, 'refs/tags/v') || github.ref_name == 'develop' ) }}
+    needs: [minizinc, build]
+    if: ${{ github.event_name != 'pull_request' && ( startsWith(github.ref, 'refs/tags/v') || github.ref_name == 'develop' || github.ref_name == 'service' ) && (github.event_name != 'schedule' || needs.minizinc.outputs.cache-hit != 'true') }}
     steps:
       - uses: actions/setup-node@v4
         with:
@@ -159,28 +178,38 @@ jobs:
         if: ${{ github.ref_name == 'develop' }}
         run: |
           if [ -z "$NODE_AUTH_TOKEN" ]; then
-            npm publish minizinc-*.tgz --tag edge --dry-run
+            npm publish minizinc.tgz --tag edge --access public --dry-run
           else
-            npm publish minizinc-*.tgz --tag edge
+            npm publish minizinc.tgz --tag edge --access public
           fi
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM }}
+      - name: Publish service version
+        if: ${{ github.ref_name == 'service' }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            npm publish minizinc.tgz --tag service --access public --dry-run
+          else
+            npm publish minizinc.tgz --tag service --access public
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM }}
       - name: Publish latest version
         if: ${{ startsWith(github.ref, 'refs/tags/v') }}
         run: |
           if [ -z "$NODE_AUTH_TOKEN" ]; then
-            npm publish minizinc-*.tgz --dry-run
+            npm publish minizinc.tgz --access public --dry-run
           else
-            npm publish minizinc-*.tgz
+            npm publish minizinc.tgz --access public
           fi
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM }}
 
   pages:
     name: Publish documentation
     runs-on: ubuntu-latest
-    needs: [build]
-    if: ${{ github.event_name != 'pull_request' && ( github.ref_name == 'develop' || github.ref_name == 'stable' || startsWith(github.ref, 'refs/tags/v') ) }}
+    needs: [minizinc, build]
+    if: ${{ github.event_name != 'pull_request' && ( github.ref_name == 'develop' || github.ref_name == 'service' || github.ref_name == 'stable' || startsWith(github.ref, 'refs/tags/v') ) && (github.event_name != 'schedule' || needs.minizinc.outputs.cache-hit != 'true') }}
     steps:
       - name: Fetch documentation
         uses: actions/download-artifact@v4
@@ -195,6 +224,12 @@ jobs:
           sed -i 's#/minizinc/dist/#/minizinc@edge/dist/#g' docs/index.html
           sed -i 's/npm install minizinc/npm install minizinc@edge/g' docs/index.html
           sed -i 's#https://js.minizinc.dev/docs/stable/#https://js.minizinc.dev/docs/develop/#g' docs/index.html
+      - name: Set package usages to point to service
+        if: ${{ github.ref_name == 'service' }}
+        run: |
+          sed -i 's#/minizinc/dist/#/minizinc@service/dist/#g' docs/index.html
+          sed -i 's/npm install minizinc/npm install minizinc@service/g' docs/index.html
+          sed -i 's#https://js.minizinc.dev/docs/stable/#https://js.minizinc.dev/docs/service/#g' docs/index.html
       - name: Publish documentation
         uses: peaceiris/actions-gh-pages@v4
         with:
@@ -219,6 +254,16 @@ jobs:
             https://cdn.jsdelivr.net/npm/minizinc@edge/dist/minizinc-worker.js
             https://cdn.jsdelivr.net/npm/minizinc@edge/dist/minizinc.wasm
             https://cdn.jsdelivr.net/npm/minizinc@edge/dist/minizinc.data
+      - name: Purge jsDelivr service cache
+        if: ${{ github.ref_name == 'service' }}
+        uses: gacts/purge-jsdelivr-cache@v1
+        with:
+          url: |
+            https://cdn.jsdelivr.net/npm/minizinc@service/dist/minizinc.js
+            https://cdn.jsdelivr.net/npm/minizinc@service/dist/minizinc.mjs
+            https://cdn.jsdelivr.net/npm/minizinc@service/dist/minizinc-worker.js
+            https://cdn.jsdelivr.net/npm/minizinc@service/dist/minizinc.wasm
+            https://cdn.jsdelivr.net/npm/minizinc@service/dist/minizinc.data
       - name: Purge jsDelivr latest cache
         if: ${{ startsWith(github.ref, 'refs/tags/v') }}
         uses: gacts/purge-jsdelivr-cache@v1
